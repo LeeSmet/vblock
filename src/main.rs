@@ -2,9 +2,9 @@ use clap::{Arg, ArgAction, Command};
 use libublk::{
     ctrl::UblkCtrl,
     dev_flags::UBLK_DEV_F_ADD_DEV,
-    io::UblkQueue,
+    io::{UblkIOCtx, UblkQueue},
     sys::{ublk_param_basic, ublk_params, UBLK_F_UNPRIVILEGED_DEV, UBLK_PARAM_TYPE_BASIC},
-    UblkSession, UblkSessionBuilder,
+    UblkIORes, UblkSession, UblkSessionBuilder,
 };
 
 /// Size of a logical block in bytes. LBA offset is always a multiple of LBA size.
@@ -137,7 +137,7 @@ fn add_vblock_device(id: i32, nr_queues: u32, depth: u32) {
                 },
                 ..Default::default()
             };
-            dev.set_target_json(serde_json::json!({"vlbock": id}));
+            dev.set_target_json(serde_json::json!({"vblock": id}));
 
             Ok(0)
         })
@@ -150,7 +150,32 @@ fn add_vblock_device(id: i32, nr_queues: u32, depth: u32) {
             UblkQueue::new(queue_id, dev)
                 .unwrap()
                 .wait_and_handle_io(|queue, tag, io_ctx| {
-                    todo!();
+                    let io_descriptor = queue.get_iod(tag);
+                    // TODO: Is this mask needed?
+                    let op = io_descriptor.op_flags & 0xff;
+                    let data = UblkIOCtx::build_user_data(tag, op, 0, true);
+                    if io_ctx.is_tgt_io() {
+                        let user_data = io_ctx.user_data();
+                        let res = io_ctx.result();
+                        let cqe_tag = UblkIOCtx::user_data_to_tag(user_data);
+
+                        assert!(cqe_tag == tag as u32);
+
+                        // -11 == EAGAIN
+                        if res != -11 {
+                            queue.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
+                            return;
+                        }
+                    }
+
+                    // TODO: properly
+                    // let res = todo!();
+                    let res = -5; // EIO
+                    if res < 0 {
+                        queue.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
+                    } else {
+                        todo!();
+                    }
                 });
         },
         move |device_id| {
