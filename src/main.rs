@@ -109,12 +109,12 @@ fn add_vblock_device(id: i32, nr_queues: u32, depth: u32) {
     let sess = UblkSessionBuilder::default()
         .name("vblock")
         .id(id)
-        .ctrl_flags(libublk::sys::UBLK_F_UNPRIVILEGED_DEV)
+        //.ctrl_flags(libublk::sys::UBLK_F_UNPRIVILEGED_DEV)
         .nr_queues(nr_queues)
         .depth(depth)
         // TODO: figure out good value here
         .io_buf_bytes(1u32 << 20)
-        .dev_flags(UBLK_F_UNPRIVILEGED_DEV)
+        .dev_flags(UBLK_DEV_F_ADD_DEV)
         .build()
         .unwrap();
 
