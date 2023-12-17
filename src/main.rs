@@ -2,6 +2,7 @@ use clap::{Arg, ArgAction, Command};
 use libublk::{
     ctrl::UblkCtrl,
     dev_flags::UBLK_DEV_F_ADD_DEV,
+    io::UblkQueue,
     sys::{ublk_param_basic, ublk_params, UBLK_F_UNPRIVILEGED_DEV, UBLK_PARAM_TYPE_BASIC},
     UblkSession, UblkSessionBuilder,
 };
@@ -141,4 +142,21 @@ fn add_vblock_device(id: i32, nr_queues: u32, depth: u32) {
             Ok(0)
         })
         .unwrap();
+
+    sess.run_target(
+        &mut ctrl,
+        &dev,
+        |queue_id, dev| {
+            UblkQueue::new(queue_id, dev)
+                .unwrap()
+                .wait_and_handle_io(|queue, tag, io_ctx| {
+                    todo!();
+                });
+        },
+        move |device_id| {
+            let mut device_ctrl = UblkCtrl::new_simple(device_id, 0).unwrap();
+            device_ctrl.dump();
+        },
+    )
+    .unwrap();
 }
