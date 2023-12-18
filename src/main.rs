@@ -8,6 +8,7 @@ use libublk::{
 };
 
 mod kernel;
+mod layout;
 
 pub fn main() {
     // TODO: There are way better ways to do this.
