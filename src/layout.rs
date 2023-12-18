@@ -46,10 +46,10 @@ impl Layout {
             let fd = target.as_raw_fd();
 
             let mut size = 0;
-            let mut physical_block_size = 0i32;
-            let mut logical_block_size = 0i32;
-            let mut minimum_io_size = 0i32;
-            let mut optimal_io_size = 0i32;
+            let mut physical_block_size = 0;
+            let mut logical_block_size = 0;
+            let mut minimum_io_size = 0;
+            let mut optimal_io_size = 0;
 
             // SAFETY: ioctls on a valid file descriptor
             unsafe {
