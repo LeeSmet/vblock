@@ -9,4 +9,5 @@ edition = "2021"
 clap = { version = "4.4.11", features = ["derive"] }
 libublk = "0.2.1"
 log = "0.4.20"
+nix = { version = "0.27.1", features = ["ioctl"] }
 serde_json = "1.0.108"
