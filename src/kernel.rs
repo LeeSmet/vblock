@@ -1,4 +1,4 @@
-use nix::{ioctl_none, ioctl_read};
+use nix::{ioctl_none, ioctl_read, ioctl_read_bad, request_code_none};
 
 /// Identifier for ioctl on block devices, defined in linux/fs.h
 const BLK_IOCTL_ID: u8 = 0x12;
@@ -14,11 +14,14 @@ const BLK_IOOPT_IOCTL_SEQNO: u8 = 121;
 /// Ioctl sequence number for BLKSPBZGET, defined in linux/fs.h
 const BLK_PBSZGET_IOCTL_SEQNO: u8 = 123;
 
-ioctl_none! {
+// TODO: figure out why these don't work with ioctl_none! but do with ioctl_read_bad! and passing
+// request_code_none!
+
+ioctl_read_bad! {
     /// Get the sector size / logical block size of a block device.
     ioctl_blksszget,
-    BLK_IOCTL_ID,
-    BLK_SSZGET_IOCTL_SEQNO
+    request_code_none!(BLK_IOCTL_ID, BLK_SSZGET_IOCTL_SEQNO),
+    i32
 }
 
 ioctl_read! {
@@ -29,23 +32,23 @@ ioctl_read! {
     u64
 }
 
-ioctl_none! {
+ioctl_read_bad! {
     /// Get minimum io size of a block device.
     ioctl_blkiomin,
-    BLK_IOCTL_ID,
-    BLK_IOMIN_IOCTL_SEQNO
+    request_code_none!(BLK_IOCTL_ID, BLK_IOMIN_IOCTL_SEQNO),
+    i32
 }
 
-ioctl_none! {
+ioctl_read_bad! {
     /// Get the optimal io size of a block device, if any.
     ioctl_blkioopt,
-    BLK_IOCTL_ID,
-    BLK_IOOPT_IOCTL_SEQNO
+    request_code_none!(BLK_IOCTL_ID, BLK_IOOPT_IOCTL_SEQNO),
+    i32
 }
 
-ioctl_none! {
+ioctl_read_bad! {
     /// Get the physical block size of a block device.
     ioctl_blkpbszget,
-    BLK_IOCTL_ID,
-    BLK_SSZGET_IOCTL_SEQNO
+    request_code_none!(BLK_IOCTL_ID, BLK_PBSZGET_IOCTL_SEQNO),
+    i32
 }
