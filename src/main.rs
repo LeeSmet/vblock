@@ -2,7 +2,7 @@ use clap::{Arg, ArgAction, Command};
 use libublk::{
     ctrl::UblkCtrl,
     dev_flags::UBLK_DEV_F_ADD_DEV,
-    io::{UblkIOCtx, UblkQueue},
+    io::{UblkDev, UblkIOCtx, UblkQueue},
     sys::{ublk_param_basic, ublk_params, UBLK_PARAM_TYPE_BASIC},
     UblkIORes, UblkSession, UblkSessionBuilder,
 };
@@ -153,45 +153,42 @@ fn add_vblock_device(id: i32, nr_queues: u32, depth: u32) {
         })
         .unwrap();
 
-    sess.run_target(
-        &mut ctrl,
-        &dev,
-        |queue_id, dev| {
-            UblkQueue::new(queue_id, dev)
-                .unwrap()
-                .wait_and_handle_io(|queue, tag, io_ctx| {
-                    let io_descriptor = queue.get_iod(tag);
-                    // TODO: Is this mask needed?
-                    let op = io_descriptor.op_flags & 0xff;
-                    let data = UblkIOCtx::build_user_data(tag, op, 0, true);
-                    if io_ctx.is_tgt_io() {
-                        let user_data = io_ctx.user_data();
-                        let res = io_ctx.result();
-                        let cqe_tag = UblkIOCtx::user_data_to_tag(user_data);
-
-                        assert!(cqe_tag == tag as u32);
-
-                        // -11 == EAGAIN
-                        if res != -11 {
-                            queue.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
-                            return;
-                        }
-                    }
-
-                    // TODO: properly
-                    // let res = todo!();
-                    let res = -5; // EIO
-                    if res < 0 {
-                        queue.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
-                    } else {
-                        todo!();
-                    }
-                });
-        },
-        move |device_id| {
-            let mut device_ctrl = UblkCtrl::new_simple(device_id, 0).unwrap();
-            device_ctrl.dump();
-        },
-    )
+    sess.run_target(&mut ctrl, &dev, queue_handler, |device_id| {
+        let mut device_ctrl = UblkCtrl::new_simple(device_id, 0).unwrap();
+        device_ctrl.dump();
+    })
     .unwrap();
+}
+
+fn queue_handler(queue_id: u16, dev: &UblkDev) {
+    UblkQueue::new(queue_id, dev)
+        .unwrap()
+        .wait_and_handle_io(|queue, tag, io_ctx| {
+            let io_descriptor = queue.get_iod(tag);
+            // TODO: Is this mask needed?
+            let op = io_descriptor.op_flags & 0xff;
+            let data = UblkIOCtx::build_user_data(tag, op, 0, true);
+            if io_ctx.is_tgt_io() {
+                let user_data = io_ctx.user_data();
+                let res = io_ctx.result();
+                let cqe_tag = UblkIOCtx::user_data_to_tag(user_data);
+
+                assert!(cqe_tag == tag as u32);
+
+                // -11 == EAGAIN
+                if res != -11 {
+                    queue.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
+                    return;
+                }
+            }
+
+            // TODO: properly
+            // let res = todo!();
+            let res = -5; // EIO
+            if res < 0 {
+                queue.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
+            } else {
+                todo!();
+            }
+        });
 }
