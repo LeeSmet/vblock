@@ -48,6 +48,7 @@ pub fn main() {
                 ),
         )
         .subcommand(Command::new("list").about("List all virtual block devices"))
+        .subcommand(Command::new("features").about("List all supported features"))
         .get_matches();
 
     match matches.subcommand() {
@@ -80,6 +81,36 @@ pub fn main() {
             // And remove it
             let _ = ctrl.del_dev();
         }
+        Some(("features", _)) => match UblkCtrl::get_features() {
+            Some(f) => {
+                const NR_FEATURES: usize = 9;
+                const FEATURES_TABLE: [&'static str; NR_FEATURES] = [
+                    "ZERO_COPY",
+                    "COMP_IN_TASK",
+                    "NEED_GET_DATA",
+                    "USER_RECOVERY",
+                    "USER_RECOVERY_REISSUE",
+                    "UNPRIVILEGED_DEV",
+                    "CMD_IOCTL_ENCODE",
+                    "USER_COPY",
+                    "ZONED",
+                ];
+                println!("\t{:<22} {:#12x}", "UBLK FEATURES", f);
+                for i in 0..64 {
+                    if ((1_u64 << i) & f) == 0 {
+                        continue;
+                    }
+
+                    let feat = if i < NR_FEATURES {
+                        FEATURES_TABLE[i]
+                    } else {
+                        "unknown"
+                    };
+                    println!("\t{:<22} {:#12x}", feat, 1_u64 << i);
+                }
+            }
+            None => eprintln!("not support GET_FEATURES, require linux v6.5"),
+        },
         _ => println!("Unsupported command"),
     }
 }
