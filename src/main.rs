@@ -40,9 +40,8 @@ pub fn main() {
             Command::new("del")
                 .about("Delete a virtual block device")
                 .arg(
-                    Arg::new("number")
-                        .short('n')
-                        .long("number")
+                    Arg::new("id")
+                        .long("id")
                         .required(true)
                         .help("device id to delete")
                         .action(ArgAction::Set),
@@ -69,6 +68,18 @@ pub fn main() {
         Some(("list", _)) => UblkSession::for_each_dev_id(|dev_id| {
             UblkCtrl::new_simple(dev_id as i32, 0).unwrap().dump();
         }),
+        Some(("del", del_matches)) => {
+            let id = del_matches
+                .get_one::<String>("id")
+                .unwrap()
+                .parse::<i32>()
+                .unwrap();
+            let mut ctrl = UblkCtrl::new_simple(id, 0).unwrap();
+            // Stop the device
+            let _ = ctrl.kill_dev();
+            // And remove it
+            let _ = ctrl.del_dev();
+        }
         _ => println!("Unsupported command"),
     }
 }
