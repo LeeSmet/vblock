@@ -1,3 +1,5 @@
+use std::{collections::HashMap, fs::OpenOptions, io, path::PathBuf};
+
 use clap::{Arg, ArgAction, Command};
 use libublk::{
     ctrl::UblkCtrl,
@@ -34,6 +36,13 @@ pub fn main() {
                         .default_value("1")
                         .help("number of hardware queues")
                         .action(ArgAction::Set),
+                )
+                .arg(
+                    Arg::new("target")
+                        .short('t')
+                        .long("target")
+                        .help("backing device")
+                        .action(ArgAction::Set),
                 ),
         )
         .subcommand(
@@ -63,8 +72,9 @@ pub fn main() {
                 .unwrap()
                 .parse::<u32>()
                 .unwrap_or(1);
+            let target = add_matches.get_one::<String>("target").unwrap();
             let depth = 64;
-            add_vblock_device(id, nr_queues, depth);
+            add_vblock_device(id, nr_queues, depth, target.into());
         }
         Some(("list", _)) => UblkSession::for_each_dev_id(|dev_id| {
             UblkCtrl::new_simple(dev_id as i32, 0).unwrap().dump();
@@ -116,7 +126,9 @@ pub fn main() {
 }
 
 /// Add a new virtual block device
-fn add_vblock_device(id: i32, nr_queues: u32, depth: u32) {
+fn add_vblock_device(id: i32, nr_queues: u32, depth: u32, target: PathBuf) {
+    let backing = Backing::new(target).unwrap();
+
     let sess = UblkSessionBuilder::default()
         .name("vblock")
         .id(id)
@@ -153,42 +165,83 @@ fn add_vblock_device(id: i32, nr_queues: u32, depth: u32) {
         })
         .unwrap();
 
-    sess.run_target(&mut ctrl, &dev, queue_handler, |device_id| {
+    sess.run_target(&mut ctrl, &dev, backing.as_queue_handler(), |device_id| {
         let mut device_ctrl = UblkCtrl::new_simple(device_id, 0).unwrap();
         device_ctrl.dump();
     })
     .unwrap();
 }
 
-fn queue_handler(queue_id: u16, dev: &UblkDev) {
-    UblkQueue::new(queue_id, dev)
-        .unwrap()
-        .wait_and_handle_io(|queue, tag, io_ctx| {
-            let io_descriptor = queue.get_iod(tag);
-            // TODO: Is this mask needed?
-            let op = io_descriptor.op_flags & 0xff;
-            let data = UblkIOCtx::build_user_data(tag, op, 0, true);
-            if io_ctx.is_tgt_io() {
-                let user_data = io_ctx.user_data();
-                let res = io_ctx.result();
-                let cqe_tag = UblkIOCtx::user_data_to_tag(user_data);
+struct Backing {
+    path: PathBuf,
+    target: std::fs::File,
+    // Map of 1GB areas of Vdisk to actual backing.
+    mapping: HashMap<u64, u64>,
+}
 
-                assert!(cqe_tag == tag as u32);
+// TODO: very dumb temporary impl
+impl Clone for Backing {
+    fn clone(&self) -> Self {
+        Backing {
+            path: self.path.clone(),
+            target: OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.path)
+                .unwrap(),
+            mapping: self.mapping.clone(),
+        }
+    }
+}
 
-                // -11 == EAGAIN
-                if res != -11 {
-                    queue.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
-                    return;
+impl Backing {
+    fn as_queue_handler(self) -> impl FnOnce(u16, &UblkDev) + Send + Sync + Clone + 'static {
+        move |queue_id, dev| self.queue_handler(queue_id, dev)
+    }
+
+    fn new(path: PathBuf) -> Result<Self, io::Error> {
+        let target = OpenOptions::new().read(true).write(true).open(&path)?;
+
+        // TODO: temp for testing
+        let mapping = (0..10).into_iter().map(|i| (i, i + 1)).collect();
+
+        Ok(Backing {
+            path,
+            target,
+            mapping,
+        })
+    }
+
+    fn queue_handler(&self, queue_id: u16, dev: &UblkDev) {
+        UblkQueue::new(queue_id, dev)
+            .unwrap()
+            .wait_and_handle_io(|queue, tag, io_ctx| {
+                let io_descriptor = queue.get_iod(tag);
+                // TODO: Is this mask needed?
+                let op = io_descriptor.op_flags & 0xff;
+                let data = UblkIOCtx::build_user_data(tag, op, 0, true);
+                if io_ctx.is_tgt_io() {
+                    let user_data = io_ctx.user_data();
+                    let res = io_ctx.result();
+                    let cqe_tag = UblkIOCtx::user_data_to_tag(user_data);
+
+                    assert!(cqe_tag == tag as u32);
+
+                    // -11 == EAGAIN
+                    if res != -11 {
+                        queue.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
+                        return;
+                    }
                 }
-            }
 
-            // TODO: properly
-            // let res = todo!();
-            let res = -5; // EIO
-            if res < 0 {
-                queue.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
-            } else {
-                todo!();
-            }
-        });
+                // TODO: properly
+                // let res = todo!();
+                let res = -5; // EIO
+                if res < 0 {
+                    queue.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
+                } else {
+                    todo!();
+                }
+            });
+    }
 }
