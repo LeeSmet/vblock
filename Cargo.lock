@@ -710,6 +710,7 @@ name = "vblock"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "io-uring",
  "libublk",
  "log",
  "nix",

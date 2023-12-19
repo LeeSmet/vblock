@@ -1,16 +1,36 @@
-use std::{collections::HashMap, fs::OpenOptions, io, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs::OpenOptions,
+    io,
+    os::{fd::AsRawFd, unix::prelude::OpenOptionsExt},
+    path::PathBuf,
+    rc::Rc,
+};
 
 use clap::{Arg, ArgAction, Command};
+use io_uring::{opcode, squeue, types};
 use libublk::{
     ctrl::UblkCtrl,
-    dev_flags::UBLK_DEV_F_ADD_DEV,
+    dev_flags::{UBLK_DEV_F_ADD_DEV, UBLK_DEV_F_ASYNC},
+    exe::{Executor, UringOpFuture},
     io::{UblkDev, UblkIOCtx, UblkQueue},
-    sys::{ublk_param_basic, ublk_params, UBLK_PARAM_TYPE_BASIC},
-    UblkIORes, UblkSession, UblkSessionBuilder,
+    sys::{
+        ublk_param_basic, ublk_params, UBLK_IO_COMMIT_AND_FETCH_REQ, UBLK_IO_FETCH_REQ,
+        UBLK_IO_RES_ABORT, UBLK_PARAM_TYPE_BASIC,
+    },
+    UblkSession, UblkSessionBuilder,
 };
 
 mod kernel;
 mod layout;
+
+/// -libc::EINVAL error code
+const EINVAL: i32 = -22;
+/// -libc::EAGAIN error code
+const EAGAIN: i32 = -11;
+
+/// libc::O_DIRECT flag
+const O_DIRECT: i32 = 0x4000;
 
 pub fn main() {
     // TODO: There are way better ways to do this.
@@ -137,12 +157,18 @@ fn add_vblock_device(id: i32, nr_queues: u32, depth: u32, target: PathBuf) {
         .depth(depth)
         // TODO: figure out good value here
         .io_buf_bytes(1u32 << 20)
-        .dev_flags(UBLK_DEV_F_ADD_DEV)
+        .dev_flags(UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_ASYNC)
         .build()
         .unwrap();
 
     let (mut ctrl, dev) = sess
         .create_devices(|dev| {
+            // Register backing file -> allows uring fixed io
+            let tgt = &mut dev.tgt;
+            let nr_fds = tgt.nr_fds;
+            tgt.fds[nr_fds as usize] = backing.target.as_raw_fd();
+            tgt.nr_fds += 1;
+
             dev.tgt.dev_size = 10 << 30;
             dev.tgt.params = ublk_params {
                 types: UBLK_PARAM_TYPE_BASIC,
@@ -151,7 +177,7 @@ fn add_vblock_device(id: i32, nr_queues: u32, depth: u32, target: PathBuf) {
                     logical_bs_shift: 9,
                     physical_bs_shift: 9,
                     // bitshifts of 1 in sector?
-                    io_opt_shift: 12,
+                    io_opt_shift: 0,
                     io_min_shift: 9,
                     max_sectors: dev.dev_info.max_io_buf_bytes >> 9,
                     dev_sectors: dev.tgt.dev_size >> 9,
@@ -187,6 +213,7 @@ impl Clone for Backing {
             target: OpenOptions::new()
                 .read(true)
                 .write(true)
+                .custom_flags(O_DIRECT)
                 .open(&self.path)
                 .unwrap(),
             mapping: self.mapping.clone(),
@@ -200,7 +227,11 @@ impl Backing {
     }
 
     fn new(path: PathBuf) -> Result<Self, io::Error> {
-        let target = OpenOptions::new().read(true).write(true).open(&path)?;
+        let target = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(O_DIRECT)
+            .open(&path)?;
 
         // TODO: temp for testing
         let mapping = (0..10).into_iter().map(|i| (i, i + 1)).collect();
@@ -213,35 +244,156 @@ impl Backing {
     }
 
     fn queue_handler(&self, queue_id: u16, dev: &UblkDev) {
-        UblkQueue::new(queue_id, dev)
-            .unwrap()
-            .wait_and_handle_io(|queue, tag, io_ctx| {
-                let io_descriptor = queue.get_iod(tag);
-                // TODO: Is this mask needed?
-                let op = io_descriptor.op_flags & 0xff;
-                let data = UblkIOCtx::build_user_data(tag, op, 0, true);
-                if io_ctx.is_tgt_io() {
-                    let user_data = io_ctx.user_data();
-                    let res = io_ctx.result();
-                    let cqe_tag = UblkIOCtx::user_data_to_tag(user_data);
+        let queue = Rc::new(UblkQueue::new(queue_id, dev).unwrap());
+        let exe = Executor::new(dev.get_nr_ios());
 
-                    assert!(cqe_tag == tag as u32);
+        let depth = dev.dev_info.queue_depth;
 
-                    // -11 == EAGAIN
-                    if res != -11 {
-                        queue.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
-                        return;
+        for tag in 0..depth as u16 {
+            let queue = queue.clone();
+            exe.spawn(tag as u16, async move {
+                let buf_addr = queue.get_io_buf_addr(tag);
+                // This MUST be the first command submitted.
+                let mut cmd_op = UBLK_IO_FETCH_REQ;
+                let mut res = 0;
+                loop {
+                    let cmd_res = queue.submit_io_cmd(tag, cmd_op, buf_addr, res).await;
+                    if cmd_res == UBLK_IO_RES_ABORT {
+                        break;
                     }
-                }
 
-                // TODO: properly
-                // let res = todo!();
-                let res = -5; // EIO
-                if res < 0 {
-                    queue.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
-                } else {
-                    todo!();
+                    res = handle_io_cmd(&queue, tag).await;
+                    cmd_op = UBLK_IO_COMMIT_AND_FETCH_REQ;
                 }
             });
+        }
+
+        queue.wait_and_wake_io_tasks(&exe);
+        // Sync version?
+        //queue.wait_and_handle_io(|queue, tag, io_ctx| {
+        //    let io_descriptor = queue.get_iod(tag);
+        //    // TODO: Is this mask needed?
+        //    let op = io_descriptor.op_flags & 0xff;
+        //    let data = UblkIOCtx::build_user_data(tag, op, 0, true);
+        //    if io_ctx.is_tgt_io() {
+        //        let user_data = io_ctx.user_data();
+        //        let res = io_ctx.result();
+        //        let cqe_tag = UblkIOCtx::user_data_to_tag(user_data);
+
+        //        assert!(cqe_tag == tag as u32);
+
+        //        // -11 == EAGAIN
+        //        if res != -11 {
+        //            queue.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
+        //            return;
+        //        }
+        //    }
+
+        //    // TODO: properly
+        //    // let res = todo!();
+        //    let res = -5; // EIO
+        //    if res < 0 {
+        //        queue.complete_io_cmd(tag, Ok(UblkIORes::Result(res)));
+        //    } else {
+        //        todo!();
+        //    }
+        //});
     }
+}
+
+#[inline]
+fn prep_io_cmd_submission(io_descriptor: &libublk::sys::ublksrv_io_desc) -> i32 {
+    let op = io_descriptor.op_flags & 0xff;
+
+    match op {
+        libublk::sys::UBLK_IO_OP_FLUSH
+        | libublk::sys::UBLK_IO_OP_READ
+        | libublk::sys::UBLK_IO_OP_WRITE => return 0,
+        _ => return EINVAL,
+    };
+}
+
+#[inline]
+fn submit_io_cmd(
+    queue: &UblkQueue<'_>,
+    tag: u16,
+    io_descriptor: &libublk::sys::ublksrv_io_desc,
+    data: u64,
+) {
+    let op = io_descriptor.op_flags & 0xff;
+    // either start to handle or retry
+    // Add 1 GiB for now
+    // TODO: proper offset calculation
+    let off = (io_descriptor.start_sector << 9) as u64 + (1 << 30);
+    let bytes = (io_descriptor.nr_sectors << 9) as u32;
+    let buf_addr = queue.get_io_buf_addr(tag);
+
+    match op {
+        libublk::sys::UBLK_IO_OP_FLUSH => {
+            let sqe = &opcode::SyncFileRange::new(types::Fixed(1), bytes)
+                .offset(off)
+                .build()
+                .flags(squeue::Flags::FIXED_FILE)
+                .user_data(data);
+            unsafe {
+                queue
+                    .q_ring
+                    .borrow_mut()
+                    .submission()
+                    .push(sqe)
+                    .expect("flush submission fail");
+            }
+        }
+        libublk::sys::UBLK_IO_OP_READ => {
+            let sqe = &opcode::Read::new(types::Fixed(1), buf_addr, bytes)
+                .offset(off)
+                .build()
+                .flags(squeue::Flags::FIXED_FILE)
+                .user_data(data);
+            unsafe {
+                queue
+                    .q_ring
+                    .borrow_mut()
+                    .submission()
+                    .push(sqe)
+                    .expect("read submission fail");
+            }
+        }
+        libublk::sys::UBLK_IO_OP_WRITE => {
+            let sqe = &opcode::Write::new(types::Fixed(1), buf_addr, bytes)
+                .offset(off)
+                .build()
+                .flags(squeue::Flags::FIXED_FILE)
+                .user_data(data);
+            unsafe {
+                queue
+                    .q_ring
+                    .borrow_mut()
+                    .submission()
+                    .push(sqe)
+                    .expect("write submission fail");
+            }
+        }
+        _ => {}
+    };
+}
+
+async fn handle_io_cmd(queue: &UblkQueue<'_>, tag: u16) -> i32 {
+    let iod = queue.get_iod(tag);
+    let op = iod.op_flags & 0xff;
+    let user_data = UblkIOCtx::build_user_data_async(tag as u16, op, 0);
+    let res = prep_io_cmd_submission(iod);
+    if res < 0 {
+        return res;
+    }
+
+    for _ in 0..4 {
+        submit_io_cmd(queue, tag, iod, user_data);
+        let res = UringOpFuture { user_data }.await;
+        if res != EAGAIN {
+            return res;
+        }
+    }
+
+    return EAGAIN;
 }
