@@ -93,7 +93,7 @@ pub fn main() {
                 .parse::<u32>()
                 .unwrap_or(1);
             let target = add_matches.get_one::<String>("target").unwrap();
-            let depth = 64;
+            let depth = 1024;
             add_vblock_device(id, nr_queues, depth, target.into());
         }
         Some(("list", _)) => UblkSession::for_each_dev_id(|dev_id| {
@@ -147,7 +147,7 @@ pub fn main() {
 
 /// Add a new virtual block device
 fn add_vblock_device(id: i32, nr_queues: u32, depth: u32, target: PathBuf) {
-    let backing = Backing::new(target).unwrap();
+    let (backing, target) = Backing::new(target).unwrap();
 
     let sess = UblkSessionBuilder::default()
         .name("vblock")
@@ -156,7 +156,7 @@ fn add_vblock_device(id: i32, nr_queues: u32, depth: u32, target: PathBuf) {
         .nr_queues(nr_queues)
         .depth(depth)
         // TODO: figure out good value here
-        .io_buf_bytes(1u32 << 20)
+        .io_buf_bytes(1u32 << 19)
         .dev_flags(UBLK_DEV_F_ADD_DEV | UBLK_DEV_F_ASYNC)
         .build()
         .unwrap();
@@ -166,7 +166,7 @@ fn add_vblock_device(id: i32, nr_queues: u32, depth: u32, target: PathBuf) {
             // Register backing file -> allows uring fixed io
             let tgt = &mut dev.tgt;
             let nr_fds = tgt.nr_fds;
-            tgt.fds[nr_fds as usize] = backing.target.as_raw_fd();
+            tgt.fds[nr_fds as usize] = target.as_raw_fd();
             tgt.nr_fds += 1;
 
             dev.tgt.dev_size = 10 << 30;
@@ -198,27 +198,10 @@ fn add_vblock_device(id: i32, nr_queues: u32, depth: u32, target: PathBuf) {
     .unwrap();
 }
 
+#[derive(Clone)]
 struct Backing {
-    path: PathBuf,
-    target: std::fs::File,
     // Map of 1GB areas of Vdisk to actual backing.
     mapping: HashMap<u64, u64>,
-}
-
-// TODO: very dumb temporary impl
-impl Clone for Backing {
-    fn clone(&self) -> Self {
-        Backing {
-            path: self.path.clone(),
-            target: OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(O_DIRECT)
-                .open(&self.path)
-                .unwrap(),
-            mapping: self.mapping.clone(),
-        }
-    }
 }
 
 impl Backing {
@@ -226,7 +209,7 @@ impl Backing {
         move |queue_id, dev| self.queue_handler(queue_id, dev)
     }
 
-    fn new(path: PathBuf) -> Result<Self, io::Error> {
+    fn new(path: PathBuf) -> Result<(Self, std::fs::File), io::Error> {
         let target = OpenOptions::new()
             .read(true)
             .write(true)
@@ -236,11 +219,7 @@ impl Backing {
         // TODO: temp for testing
         let mapping = (0..10).into_iter().map(|i| (i, i + 1)).collect();
 
-        Ok(Backing {
-            path,
-            target,
-            mapping,
-        })
+        Ok((Backing { mapping }, target))
     }
 
     fn queue_handler(&self, queue_id: u16, dev: &UblkDev) {
