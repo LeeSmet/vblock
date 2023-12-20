@@ -177,7 +177,7 @@ fn add_vblock_device(id: i32, nr_queues: u32, depth: u32, target: PathBuf) {
                     logical_bs_shift: 9,
                     physical_bs_shift: 9,
                     // bitshifts of 1 in sector?
-                    io_opt_shift: 0,
+                    io_opt_shift: 9,
                     io_min_shift: 9,
                     max_sectors: dev.dev_info.max_io_buf_bytes >> 9,
                     dev_sectors: dev.tgt.dev_size >> 9,
