@@ -5,8 +5,13 @@ use std::{
     os::{fd::AsRawFd, unix::prelude::OpenOptionsExt},
     path::PathBuf,
     rc::Rc,
+    sync::Arc,
 };
 
+use aes::{
+    cipher::{generic_array::GenericArray, KeyInit},
+    Aes128,
+};
 use clap::{Arg, ArgAction, Command};
 use io_uring::{opcode, squeue, types};
 use libublk::{
@@ -20,6 +25,7 @@ use libublk::{
     },
     UblkSession, UblkSessionBuilder,
 };
+use xts_mode::{get_tweak_default, Xts128};
 
 mod kernel;
 mod layout;
@@ -200,8 +206,7 @@ fn add_vblock_device(id: i32, nr_queues: u32, depth: u32, target: PathBuf) {
 
 #[derive(Clone)]
 struct Backing {
-    // Map of 1GB areas of Vdisk to actual backing.
-    mapping: HashMap<u64, u64>,
+    enc: Arc<Xts128<Aes128>>,
 }
 
 impl Backing {
@@ -217,9 +222,15 @@ impl Backing {
             .open(&path)?;
 
         // TODO: temp for testing
-        let mapping = (0..10).into_iter().map(|i| (i, i + 1)).collect();
+        const KEY: [u8; 32] = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 26, 27, 28, 29, 30, 31,
+        ];
+        let cipher_1 = Aes128::new(GenericArray::from_slice(&KEY[..16]));
+        let cipher_2 = Aes128::new(GenericArray::from_slice(&KEY[16..]));
+        let enc = Arc::new(Xts128::<Aes128>::new(cipher_1, cipher_2));
 
-        Ok((Backing { mapping }, target))
+        Ok((Backing { enc }, target))
     }
 
     fn queue_handler(&self, queue_id: u16, dev: &UblkDev) {
@@ -241,7 +252,7 @@ impl Backing {
                         break;
                     }
 
-                    res = handle_io_cmd(&queue, tag).await;
+                    res = handle_io_cmd(&queue, tag, self).await;
                     cmd_op = UBLK_IO_COMMIT_AND_FETCH_REQ;
                 }
             });
@@ -287,9 +298,9 @@ fn prep_io_cmd_submission(io_descriptor: &libublk::sys::ublksrv_io_desc) -> i32 
     match op {
         libublk::sys::UBLK_IO_OP_FLUSH
         | libublk::sys::UBLK_IO_OP_READ
-        | libublk::sys::UBLK_IO_OP_WRITE => return 0,
-        _ => return EINVAL,
-    };
+        | libublk::sys::UBLK_IO_OP_WRITE => 0,
+        _ => EINVAL,
+    }
 }
 
 #[inline]
@@ -298,12 +309,11 @@ fn submit_io_cmd(
     tag: u16,
     io_descriptor: &libublk::sys::ublksrv_io_desc,
     data: u64,
+    backing: &Backing,
 ) {
     let op = io_descriptor.op_flags & 0xff;
     // either start to handle or retry
-    // Add 1 GiB for now
-    // TODO: proper offset calculation
-    let off = (io_descriptor.start_sector << 9) as u64 + (1 << 30);
+    let off = (io_descriptor.start_sector << 9) as u64;
     let bytes = (io_descriptor.nr_sectors << 9) as u32;
     let buf_addr = queue.get_io_buf_addr(tag);
 
@@ -339,6 +349,14 @@ fn submit_io_cmd(
             }
         }
         libublk::sys::UBLK_IO_OP_WRITE => {
+            // Encrypt buffer first
+            let buf = unsafe { std::slice::from_raw_parts_mut(buf_addr, bytes as usize) };
+            backing.enc.encrypt_area(
+                buf,
+                512,
+                io_descriptor.start_sector as u128,
+                get_tweak_default,
+            );
             let sqe = &opcode::Write::new(types::Fixed(1), buf_addr, bytes)
                 .offset(off)
                 .build()
@@ -357,7 +375,7 @@ fn submit_io_cmd(
     };
 }
 
-async fn handle_io_cmd(queue: &UblkQueue<'_>, tag: u16) -> i32 {
+async fn handle_io_cmd(queue: &UblkQueue<'_>, tag: u16, backing: &Backing) -> i32 {
     let iod = queue.get_iod(tag);
     let op = iod.op_flags & 0xff;
     let user_data = UblkIOCtx::build_user_data_async(tag as u16, op, 0);
@@ -367,12 +385,40 @@ async fn handle_io_cmd(queue: &UblkQueue<'_>, tag: u16) -> i32 {
     }
 
     for _ in 0..4 {
-        submit_io_cmd(queue, tag, iod, user_data);
+        submit_io_cmd(queue, tag, iod, user_data, backing);
         let res = UringOpFuture { user_data }.await;
         if res != EAGAIN {
+            if res >= 0 {
+                decrypt_if_needed(queue, tag, iod, backing);
+            }
             return res;
         }
     }
 
     return EAGAIN;
+}
+
+fn decrypt_if_needed(
+    queue: &UblkQueue<'_>,
+    tag: u16,
+    io_descriptor: &libublk::sys::ublksrv_io_desc,
+    backing: &Backing,
+) {
+    let op = io_descriptor.op_flags & 0xff;
+
+    if op != libublk::sys::UBLK_IO_OP_READ {
+        return;
+    }
+
+    let bytes = (io_descriptor.nr_sectors << 9) as u32;
+    let buf_addr = queue.get_io_buf_addr(tag);
+    let buf = unsafe { std::slice::from_raw_parts_mut(buf_addr, bytes as usize) };
+
+    // Decrypt buffer
+    backing.enc.decrypt_area(
+        buf,
+        512,
+        io_descriptor.start_sector as u128,
+        get_tweak_default,
+    );
 }
